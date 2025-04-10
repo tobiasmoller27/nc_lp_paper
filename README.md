@@ -13,4 +13,4 @@ chmod +x run_GAT.sh
 ./run_GAT.sh
 ```
 
-This will produce a directory called `runs`, with folders containing the results for each dataset, named after the model, dataset and the timestamp of completion. 
+This will produce a directory called `runs`, with folders containing the results for each dataset, named after the model, dataset and the timestamp of completion. In the folder, results are stored in two `.npy` files per dataset: one containing the NC test scores and one containing the LP test scores of the run.
