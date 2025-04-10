@@ -14,3 +14,19 @@ chmod +x run_GAT.sh
 ```
 
 This will produce a directory called `runs`, with folders containing the results for each dataset, named after the model, dataset and the timestamp of completion. In the folder, results are stored in two `.npy` files per dataset: one containing the NC test scores and one containing the LP test scores of the run.
+
+The shell scripts already contain the flags used in the experiments. Below is a guide of all available flags.
+
+| Flag                   | Description                                                                                                                 |
+|------------------------|-----------------------------------------------------------------------------------------------------------------------------|
+| `--hidden_channels`    | Number of hidden channels. (Default: 64)                                                                                    |
+| `--embedding_size`     | Size of the embedding layer. (Default: 32)                                                                                  |
+| `--num_epochs`         | Number of training epochs. (Default: 250)                                                                                   |
+| `--lr_NC`              | Learning rate for Node Classification. (Default: 0.01)                                                                       |
+| `--lr_LP`              | Learning rate for Link Prediction. (Default: 0.01)                                                                           |
+| `--nbr_seeds`          | Number of random seeds to run (starting from 1). (Default: 1)                                                                |
+| `--save_results`       | Set to True if results and config should be saved in the `runs` directory. (Default: False)                                 |
+| `--two_layers`         | Set to True if you want 2 layers instead of 3 in the models. (Default: False)                                               |
+| `--msg_split_ratio`    | Fraction of message passing edges in training for LP (the rest become supervision edges). (Default: 0.3)                    |
+| `--ds`                 | Which dataset to run on. (Default: `CiteSeer` for heterophilic/homophilic)                                                                              |
+| `--neg_pos_ratio`      | How many times the amount of positive edges should the amount of negative edges be? -1 if all negative edges should be used. (Default: -1) |
