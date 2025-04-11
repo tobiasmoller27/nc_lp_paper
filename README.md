@@ -21,7 +21,7 @@ The shell scripts already contain the flags used in the experiments. Below is a 
 |------------------------|-----------------------------------------------------------------------------------------------------------------------------|
 | `--hidden_channels`    | Number of hidden channels. (Default: 64)                                                                                    |
 | `--embedding_size`     | Size of the embedding layer. (Default: 32)                                                                                  |
-| `--num_epochs`         | Number of training epochs. (Default: 250)                                                                                   |
+| `--num_epochs`         | Maximum number of training epochs. (Default: 250)                                                                                   |
 | `--lr_NC`              | Learning rate for Node Classification. (Default: 0.01)                                                                       |
 | `--lr_LP`              | Learning rate for Link Prediction. (Default: 0.01)                                                                           |
 | `--nbr_seeds`          | Number of random seeds to run (starting from 1). (Default: 1)                                                                |
