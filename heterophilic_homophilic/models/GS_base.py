@@ -19,6 +19,7 @@ from torch_geometric.utils import negative_sampling
 def parse_args():
     parser = argparse.ArgumentParser(description="NC/LP Model Hyperparameters")
     parser.add_argument("--hidden_channels", type=int, default=64, help="Number of hidden channels.")
+    parser.add_argument("--middle_size", type=int, default=48, help="Size of middle layer.")
     parser.add_argument("--embedding_size", type=int, default=32, help="Size of the embedding layer.")
     parser.add_argument("--num_epochs", type=int, default=250, help="Number of training epochs.")
     parser.add_argument("--lr_NC", type=float, default=0.01, help="Learning rate for Node Classification.")
