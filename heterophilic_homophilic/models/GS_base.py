@@ -300,15 +300,15 @@ def main():
     seed_list = range(1, num_seeds + 1)
     dataset=None
     if ds == 'CiteSeer':
-        dataset = CitationFull(root='data/CitationFull', name='CiteSeer')
+        dataset = CitationFull(root='../data/CitationFull', name='CiteSeer')
     elif ds == 'Cora_ML':
-        dataset = CitationFull(root='data/CitationFull', name='Cora_ML')
+        dataset = CitationFull(root='../data/CitationFull', name='Cora_ML')
     elif ds == 'Chameleon':
-        dataset = WikipediaNetwork(root='data/chameleon', name='chameleon')
+        dataset = WikipediaNetwork(root='../data/chameleon', name='chameleon')
     elif ds == 'Roman_Empire':
-        dataset = HeterophilousGraphDataset(root='data/RomanEmpire', name='Roman-empire')
+        dataset = HeterophilousGraphDataset(root='../data/RomanEmpire', name='Roman-empire')
     elif ds == 'Squirrel':
-        dataset = WikipediaNetwork(root='data/squirrel', name='squirrel')
+        dataset = WikipediaNetwork(root='../data/squirrel', name='squirrel')
     else:
         print("Invalid dataset name.")
         return
