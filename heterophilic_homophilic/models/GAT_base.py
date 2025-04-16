@@ -338,6 +338,17 @@ def main():
     og_data = dataset[0]
     og_data = T.ToUndirected()(og_data).to(device)
     
+    input_size = og_data.x.size(1)
+    if symmetric_sizes and not two_layers:
+        middle_size = (input_size-embedding_size)//3 + embedding_size
+        hidden_channels = (input_size-embedding_size)//3*2 + embedding_size
+        print(embedding_size)
+        print(middle_size)
+        print(hidden_channels)
+        print(input_size)
+    elif symmetric_sizes:
+        hidden_channels = (input_size+embedding_size)//2
+
     test_acc_NC = []
     test_acc_LP = []
     per_class_acc_NC = 0
