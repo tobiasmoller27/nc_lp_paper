@@ -19,6 +19,7 @@ import json
 def parse_args():
     parser = argparse.ArgumentParser(description="NC/LP Model Hyperparameters")
     parser.add_argument("--hidden_channels", type=int, default=64, help="Number of hidden channels.")
+    parser.add_argument("--middle_size", type=int, default=48, help="Size of middle layer.")
     parser.add_argument("--embedding_size", type=int, default=32, help="Size of the embedding layer.")
     parser.add_argument("--num_epochs", type=int, default=250, help="Number of training epochs.")
     parser.add_argument("--lr_NC", type=float, default=0.01, help="Learning rate for Node Classification.")
@@ -31,6 +32,8 @@ def parse_args():
     parser.add_argument("--neg_pos_ratio", type=int, default=-1, help="How many times the amount of positive edges should the amount of negative edges be? -1 if all negative edges should be used")
     parser.add_argument("--print_epochs", type=bool, default=False, help="Should epoch scores be printed (True) or not (False)?")
     parser.add_argument("--batch_size", type=int, default=20, help="Amount of source nodes in each batch.")
+    parser.add_argument("--symmetric_sizes", type=bool, default=False, help="If True, the first two layers will be chosen in a triangular shape (False)?")
+
     
     return parser.parse_known_args()[0]
 
@@ -48,10 +51,10 @@ def setup_determinism(seed):
 
 
 class GAT(torch.nn.Module):
-    def __init__(self, hidden_channels, embedding_size, two_layers, heads=4):
+    def __init__(self, hidden_channels, middle_size, embedding_size, two_layers, heads=4):
         super().__init__()
         self.conv1 = GATConv((-1, -1), hidden_channels, heads=heads, concat=True, add_self_loops=False)
-        self.conv2 = GATConv((-1, -1), 48, heads=heads, concat=True, add_self_loops=False)
+        self.conv2 = GATConv((-1, -1), middle_size, heads=heads, concat=True, add_self_loops=False)
         self.conv3 = GATConv((-1, -1), embedding_size, heads=1, concat=False, add_self_loops=False)
 
         self.conv1b = GATConv((-1, -1), hidden_channels, heads=heads, concat=True, add_self_loops=False)
@@ -73,9 +76,9 @@ class GAT(torch.nn.Module):
         return x
 
 class GAT_NC(torch.nn.Module):
-    def __init__(self, hidden_channels, embedding_size, num_classes, two_layers, heads=4):
+    def __init__(self, hidden_channels, middle_size, embedding_size, num_classes, two_layers, heads=4):
         super().__init__()
-        self.encoder = GAT(hidden_channels, embedding_size, two_layers, heads=heads)
+        self.encoder = GAT(hidden_channels, middle_size, embedding_size, two_layers, heads=heads)
         self.decoder = torch.nn.Linear(embedding_size, num_classes)
     
     def forward(self, x, edge_index):
@@ -197,9 +200,9 @@ class EdgeDecoder(torch.nn.Module):
         return out
 
 class LinkPredictor(torch.nn.Module):
-    def __init__(self, hidden_channels, embedding_size, metadata, two_layers, heads=4):
+    def __init__(self, hidden_channels, middle_size, embedding_size, metadata, two_layers, heads=4):
         super().__init__()
-        self.encoder = GAT(hidden_channels, embedding_size, two_layers, heads=heads)
+        self.encoder = GAT(hidden_channels, middle_size, embedding_size, two_layers, heads=heads)
         self.encoder = to_hetero(self.encoder, metadata)
         self.decoder = EdgeDecoder(embedding_size)
 
@@ -354,6 +357,7 @@ def save_run(test_prec_NC, test_prec_LP, hidden_channels, embedding_size, num_ep
 def main():
     args = parse_args()
     hidden_channels = args.hidden_channels
+    middle_size = args.middle_size
     embedding_size = args.embedding_size
     num_epochs = args.num_epochs
     lr_NC = args.lr_NC
@@ -366,6 +370,7 @@ def main():
     neg_pos_ratio = args.neg_pos_ratio
     print_epochs = args.print_epochs
     batch_size = args.batch_size
+    symmetric_sizes = args.symmetric_sizes
 
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -410,6 +415,17 @@ def main():
         data = transform(og_data.clone())
         num_classes = data.y.max().item() + 1
 
+        input_size = og_data.x.size(1)
+        if symmetric_sizes and not two_layers:
+            middle_size = (input_size-embedding_size)//3 + embedding_size
+            hidden_channels = (input_size-embedding_size)//3*2 + embedding_size
+            print(embedding_size)
+            print(middle_size)
+            print(hidden_channels)
+            print(input_size)
+        elif symmetric_sizes:
+            hidden_channels = (input_size+embedding_size)//2
+
         num_neighbors_NC = [10, 5, 5]
         num_workers = 4
 
@@ -441,7 +457,7 @@ def main():
                 persistent_workers=True
             )
     
-        model_NC = GAT_NC(hidden_channels, embedding_size, num_classes,two_layers).to(device)
+        model_NC = GAT_NC(hidden_channels, middle_size, embedding_size, num_classes,two_layers).to(device)
         optimizer_NC = torch.optim.Adam(model_NC.parameters(), lr=lr_NC)
         criterion_NC = torch.nn.CrossEntropyLoss()
     
@@ -522,7 +538,7 @@ def main():
             )
     
         metadata = train_data_LP.metadata()
-        model_LP = LinkPredictor(hidden_channels, embedding_size, metadata, two_layers).to(device)
+        model_LP = LinkPredictor(hidden_channels, middle_size, embedding_size, metadata, two_layers).to(device)
         optimizer_LP = torch.optim.Adam(model_LP.parameters(), lr=lr_LP)
         criterion_LP = torch.nn.BCEWithLogitsLoss()
 
