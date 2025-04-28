@@ -1,0 +1,1 @@
+{"hidden_channels": 128, "embedding_size": 128, "num_epochs": 10000, "lr_NC": 0.01, "lr_LP": 0.01, "num_seeds": 10, "two_layers": false, "msg_split_ratio": 0.3, "dataset": "OGBN", "neg_pos_ratio": 1}
