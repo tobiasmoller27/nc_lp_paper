@@ -132,7 +132,7 @@ def add_label_edges(data, device):
     total_x = torch.cat([data.x, M], dim=0)
     
     # append edges between normal nodes and label nodes
-    label_edges = torch.zeros((2, num_nodes), dtype=torch.int64, device=device)
+    label_edges = torch.zeros((2, num_nodes), dtype=torch.int64)
     label_edges[0] = torch.arange(num_nodes, dtype=torch.int64)
     label_edges[1] = data.y + num_nodes
     total_edge_index = torch.cat([data.edge_index, label_edges], dim=1)
