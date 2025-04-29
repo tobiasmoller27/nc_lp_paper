@@ -4,7 +4,7 @@ import random
 import numpy as np
 import torch
 import torch_geometric.transforms as T
-from torch_geometric.data import HeteroData
+from torch_geometric.data import Data
 from torch_geometric.transforms import RandomNodeSplit
 from torch_geometric.datasets import CitationFull
 from torch_geometric.datasets import WikipediaNetwork
@@ -15,6 +15,8 @@ from torch_geometric.loader import NeighborLoader
 from torch_geometric.utils import negative_sampling
 import time
 import json
+
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description="NC/LP Model Hyperparameters")
@@ -31,7 +33,7 @@ def parse_args():
     parser.add_argument("--neg_pos_ratio", type=int, default=-1, help="How many times the amount of positive edges should the amount of negative edges be? -1 if all negative edges should be used")
     parser.add_argument("--print_epochs", type=bool, default=False, help="Should epoch scores be printed (True) or not (False)?")
     parser.add_argument("--batch_size", type=int, default=20, help="Amount of source nodes in each batch.")
-    
+
     return parser.parse_known_args()[0]
 
 def setup_determinism(seed):
@@ -45,7 +47,6 @@ def setup_determinism(seed):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
     os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
-
 
 class GAT(torch.nn.Module):
     def __init__(self, hidden_channels, embedding_size, two_layers, heads=4):
@@ -115,76 +116,93 @@ def evaluate_node_classification(model, data, mask, og_data, loader, device):
     return correct / total
 
 
-def sub_data(data, mask):
-    s_data = HeteroData()
-    s_data['paper'].x = data.x
-    s_data['paper'].y = data.y
-    s_data['paper', 'cites', 'paper'].edge_index = data.edge_index
+def add_label_edges(data, device):
     unique_classes = data.y.unique()
-    s_data['label'].x = torch.eye(len(unique_classes), dtype=torch.float32, device='cpu')
-    mask_indices = torch.nonzero(mask, as_tuple=False).flatten()
-    label_edges = torch.zeros((2, mask_indices.size(0)), dtype=torch.int64, device='cpu')
-    label_edges[0] = mask_indices
-    label_edges[1] = data.y[mask_indices]
-    s_data['paper', 'is', 'label'].edge_index = label_edges
-    return s_data
+    num_labels = len(unique_classes)
+    num_nodes = data.x.size(0)
+    feature_size = data.x.size(1)
+    num_og_edges = data.edge_index.size(1)
 
-def split_train_edges(data, split_ratio):
-    total_edges = data['paper', 'is', 'label'].edge_index.size(1)
-    num_msg_edges = int(total_edges * split_ratio)
-    perm = torch.randperm(total_edges)
-    msg_edges = perm[:num_msg_edges]
-    sup_edges = perm[num_msg_edges:]
-    msg_edge_index = data['paper', 'is', 'label'].edge_index[:, msg_edges]
-    sup_edge_index = data['paper', 'is', 'label'].edge_index[:, sup_edges]
-    return msg_edge_index, sup_edge_index
-
-def my_negative_sampling(pos_edge_index, num_paper_nodes, num_classes, device):
-    neg_edge_index = torch.zeros((2, num_paper_nodes * (num_classes - 1)), device='cpu')
-    neg_edge_index[0, :] = pos_edge_index[0].repeat_interleave(num_classes - 1)
-    labels = torch.arange(num_classes, device='cpu')
+    # initialize label nodes as one hot vectors
+    a = torch.eye(num_labels)
+    b = torch.zeros((num_labels, feature_size-num_labels))
+    M = torch.cat([a, b], dim=1)
+    total_x = torch.cat([data.x, M], dim=0)
     
-    for i in range(num_paper_nodes):
-        positive_label = pos_edge_index[1, i].item()
-        remaining_labels = labels[labels != positive_label]
+    # append edges between normal nodes and label nodes
+    label_edges = torch.zeros((2, num_nodes), dtype=torch.int64)
+    label_edges[0] = torch.arange(num_nodes, dtype=torch.int64)
+    label_edges[1] = data.y + num_nodes
+    total_edge_index = torch.cat([data.edge_index, label_edges], dim=1)
+
+    s_data = Data(x=total_x, edge_index=total_edge_index)
+    return s_data, num_og_edges, num_nodes
+
+def split_train_edges(data, train_edges_mask, num_og_edges, num_label_edges, msg_split_ratio):
+    total_edges = num_og_edges + num_label_edges
+    label_start = total_edges - num_label_edges
+    label_indices = torch.arange(label_start, total_edges, device=data.edge_index.device) # global idx
+    train_label_idx   = label_indices[train_edges_mask] # global idx
+
+    num_train_label_edges = train_label_idx.numel()
+    num_msg_edges = int(num_train_label_edges * msg_split_ratio)
+    perm  = train_label_idx[torch.randperm(num_train_label_edges)]
+    msg_indices  = perm[:num_msg_edges]
+    sup_indices  = perm[num_msg_edges:]
+    
+    msg_edge_mask = torch.zeros(total_edges, dtype=torch.bool, device=data.edge_index.device)
+    sup_edge_mask = torch.zeros_like(msg_edge_mask)
+
+    msg_edge_mask[:num_og_edges] = True
+    msg_edge_mask[msg_indices] = True
+    sup_edge_mask[sup_indices] = True
+
+    return msg_edge_mask, sup_edge_mask
+
+def my_negative_sampling(pos_edge_index, total_paper_nodes, num_classes, device):
+    # use all negative edges!
+    num_sup_nodes = pos_edge_index.size(1)
+    neg_edge_index = torch.zeros((2, num_sup_nodes * (num_classes - 1)), device=device)
+    neg_edge_index[0, :] = pos_edge_index[0].repeat_interleave(num_classes - 1)
+    labels = torch.arange(num_classes, device=device)
+    
+    for i in range(num_sup_nodes):
+        positive_label = pos_edge_index[1, i].item()-total_paper_nodes
+        remaining_labels = labels[labels != positive_label]+total_paper_nodes
         neg_edge_index[1, i * (num_classes - 1):(i + 1) * (num_classes - 1)] = remaining_labels
+
     return neg_edge_index.to(torch.int32)
 
+
 def prepare_lp_data(data, train_mask, val_mask, test_mask, device, num_classes, msg_split_ratio, neg_pos_ratio):
-    train_data_LP = sub_data(data, train_mask)
-    val_data_LP = sub_data(data, val_mask)
-    test_data_LP = sub_data(data, test_mask)
-    msg_edge_index, sup_edge_index = split_train_edges(train_data_LP, msg_split_ratio)
+    total_paper_nodes = data.x.size(0)
+    data, num_og_edges, num_nodes = add_label_edges(data, device)
+    msg_edge_mask, sup_edge_mask = split_train_edges(data, train_mask, num_og_edges, num_nodes, msg_split_ratio)
 
-    train_data_LP['paper', 'is', 'label'].edge_index = msg_edge_index
-    train_data_LP['paper', 'is', 'label'].edge_label_index = sup_edge_index
-    train_data_LP['paper', 'is', 'label'].edge_label = torch.tensor(np.ones((sup_edge_index.size(1))))
+    full_val_mask = torch.cat([torch.zeros(num_og_edges, dtype=torch.bool), val_mask])
+    full_test_mask = torch.cat([torch.zeros(num_og_edges, dtype=torch.bool), test_mask])
 
-    val_data_LP['paper', 'is', 'label'].edge_label_index = val_data_LP['paper', 'is', 'label'].edge_index
-    val_data_LP['paper', 'is', 'label'].edge_index = torch.cat((msg_edge_index, sup_edge_index), 1)
-    val_data_LP['paper', 'is', 'label'].edge_label = torch.tensor(np.ones((val_data_LP['paper', 'is', 'label'].edge_label_index.size(1))))
+    train_data_LP = Data(x=data.x, edge_index=data.edge_index[:, msg_edge_mask])
+    train_data_LP.edge_label_index = data.edge_index[:, sup_edge_mask]
+    train_data_LP.edge_label = torch.ones(train_data_LP.edge_label_index.size(0))
 
-    test_data_LP['paper', 'is', 'label'].edge_label_index = test_data_LP['paper', 'is', 'label'].edge_index
-    test_data_LP['paper', 'is', 'label'].edge_index = torch.cat(
-        (msg_edge_index, sup_edge_index, val_data_LP['paper', 'is', 'label'].edge_label_index), 1
-    )
-    test_data_LP['paper', 'is', 'label'].edge_label = torch.tensor(
-        np.ones((test_data_LP['paper', 'is', 'label'].edge_label_index.size(1)))
-    )
+    val_data_LP = Data(x=data.x, edge_index=torch.cat([train_data_LP.edge_index, train_data_LP.edge_label_index], dim=1))
+    val_data_LP.edge_label_index = data.edge_index[:, full_val_mask]
+    val_data_LP.edge_label = torch.ones(val_data_LP.edge_label_index.size(0))
+
+    test_data_LP = Data(x=data.x, edge_index=torch.cat([val_data_LP.edge_index, val_data_LP.edge_label_index], dim=1))
+    test_data_LP.edge_label_index = data.edge_index[:, full_test_mask]
+    test_data_LP.edge_label = torch.ones(test_data_LP.edge_label_index.size(0))
+
     if neg_pos_ratio == -1:
         # remember: negative sampling can be here because we use ALL possible negative edges everytime, so the sampling will be the same for each seed
         # if we run on a big dataset where we cannot use all possible negative edges, we need to sample in the training method instead, once every epoch
-        train_data_LP['paper', 'is', 'label'].neg_edge_index = my_negative_sampling(train_data_LP['paper', 'is', 'label'].edge_label_index, train_data_LP['paper', 'is', 'label'].edge_label_index.size(1), num_classes, 'cpu')
-
-
-    train_data_LP['paper'].sup_mask = torch.zeros_like(train_mask)
-    train_data_LP['paper'].sup_mask[sup_edge_index[0]] = 1
-
+        train_data_LP.neg_edge_index = my_negative_sampling(data.edge_index[:,sup_edge_mask], total_paper_nodes, num_classes, device)
     train_data_LP = T.ToUndirected()(train_data_LP)
     val_data_LP = T.ToUndirected()(val_data_LP)
     test_data_LP = T.ToUndirected()(test_data_LP)
-
     return train_data_LP, val_data_LP, test_data_LP
+
 
 class EdgeDecoder(torch.nn.Module):
     def __init__(self, embedding_size):
@@ -197,106 +215,93 @@ class EdgeDecoder(torch.nn.Module):
         return out
 
 class LinkPredictor(torch.nn.Module):
-    def __init__(self, hidden_channels, embedding_size, metadata, two_layers, heads=4):
+    def __init__(self, hidden_channels, embedding_size, two_layers):
         super().__init__()
-        self.encoder = GAT(hidden_channels, embedding_size, two_layers, heads=heads)
-        self.encoder = to_hetero(self.encoder, metadata)
+        self.encoder = GAT(hidden_channels, embedding_size, two_layers)
         self.decoder = EdgeDecoder(embedding_size)
 
-    def forward(self, x_dict, edge_index_dict):
-        z_dict = self.encoder(x_dict, edge_index_dict)
+    def forward(self, x, edge_index):
+        z_dict = self.encoder(x, edge_index)
         return z_dict
 
-    def decode(self, z_dict, edge_label_index):
-        z_paper = z_dict['paper']
-        z_label = z_dict['label']
+    def decode(self, z_dict, edge_label_index, total_paper_nodes, num_classes):
+        z_paper = z_dict[:total_paper_nodes,:]
+        z_label = z_dict[-num_classes:,:]
         src, dst = edge_label_index
-        out = self.decoder(z_paper[src], z_label[dst])
+        out = self.decoder(z_paper[src], z_label[dst-total_paper_nodes])
         return out
     
-    def decode_with_embs(self, z_paper, z_label, edge_label_index):
+    def decode_with_embs(self, z_paper, z_label, edge_label_index, total_paper_nodes):
         src, dst = edge_label_index
-        return self.decoder(z_paper[src], z_label[dst])
+        return self.decoder(z_paper[src], z_label[dst-total_paper_nodes])
     
-def embed_labels(model: LinkPredictor, label_loader, num_classes, embedding_size, device):
+    
+    
+def embed_labels(model: LinkPredictor, label_loader, num_classes, embedding_size, device, total_paper_nodes):
     label_embs = torch.zeros(num_classes, embedding_size, device=device)
     model.eval()
     with torch.no_grad():
         for batch in label_loader:
             batch=batch.to(device)
-            label_n_id = batch['label'].n_id
+            label_n_id = batch.n_id
             # forward pass to get z_dict for all node types in this subgraph
-            z_dict = model(batch.x_dict, batch.edge_index_dict)
-            z_label_sub = z_dict['label']
+            z_dict = model(batch.x, batch.edge_index)
+
+            # The first `batch.batch_size` nodes are the input nodes
+            z_label_sub = z_dict[:batch.batch_size]
+            global_ids   = batch.n_id[:batch.batch_size]   # shape [B]
+            label_idx    = global_ids - total_paper_nodes
             #place them into the big label_embs at the correct rows
-            label_embs[label_n_id] = z_label_sub
+            label_embs[label_idx] = z_label_sub  
     return label_embs
 
 def convert_batch_edges(batch, is_training, neg_pos_ratio):
-    global_to_local_paper = {gid.item(): i for i, gid in enumerate(batch['paper'].n_id)}
-    global_to_local_label = {gid.item(): i for i, gid in enumerate(batch['label'].n_id)}
-    if is_training and (neg_pos_ratio==-1):
-        # negative
-        # we only want the negative edges of the three source nodes, but we want all of them, even those that are not in the k hop subgraph!
-        neg_edge_index =  batch['paper', 'is', 'label'].neg_edge_index
-        paper_mask = torch.isin(neg_edge_index[0], batch['paper'].n_id[:batch['paper'].batch_size])
-        #label_mask = torch.isin(neg_edge_index[1], batch['label'].n_id)           
-        #final_mask = paper_mask & label_mask
-        neg_edge_index = neg_edge_index[:, paper_mask]
-        batch['paper', 'is', 'label'].neg_edge_index = neg_edge_index
-        global_neg_edge_index_label = neg_edge_index[1].unsqueeze(0)
-        local_neg_edge_index_paper = torch.tensor([[global_to_local_paper[node.item()] for node in batch['paper', 'is', 'label'].neg_edge_index[0]]], dtype=torch.long)
-        #local_neg_edge_index_label = torch.tensor([[global_to_local_label[node.item()] for node in batch['paper', 'is', 'label'].neg_edge_index[1]]], dtype=torch.long)
-        local_neg_edge_index = torch.cat((local_neg_edge_index_paper, global_neg_edge_index_label))
-        batch['paper', 'is', 'label'].neg_edge_index = local_neg_edge_index
+    global_to_local_paper = {gid.item(): i                # {global id → local row}
+                       for i, gid in enumerate(batch.n_id)}
 
     # positive
     # I will keep label ids as global but translate the paper ids to local
-    pos_edge_index = batch['paper', 'is', 'label'].edge_label_index
-    paper_mask = torch.isin(pos_edge_index[0], batch['paper'].n_id[:batch['paper'].batch_size])
+    pos_edge_index = batch.edge_label_index
+    paper_mask = torch.isin(pos_edge_index[0], batch.n_id[:batch.batch_size])
+
     pos_edge_index = pos_edge_index[:, paper_mask]
     
     
-    local_pos_edge_index_paper = torch.tensor([[global_to_local_paper[node.item()] for node in pos_edge_index[0]]], dtype=torch.long)
-    global_pos_edge_index_label = pos_edge_index[1].unsqueeze(0)
-
-    local_pos_edge_index = torch.cat((local_pos_edge_index_paper, global_pos_edge_index_label), dim=0)
-    batch['paper', 'is', 'label'].edge_label_index = local_pos_edge_index
-
-    # uncomment to turn local label ids into global for the message passing edges as well
-    #batch['paper', 'is', 'label'].edge_index[1] = batch['label'].n_id[batch['paper', 'is', 'label'].edge_index[1]]
-    #batch['label', 'rev_is', 'paper'].edge_index[0] = batch['label'].n_id[batch['label', 'rev_is', 'paper'].edge_index[0]]
-    
+    src_local = torch.tensor(
+        [global_to_local_paper[g.item()] for g in pos_edge_index[0]],
+        dtype=torch.long,
+        device=pos_edge_index.device
+    )
+    batch.edge_label_index = torch.stack([src_local, pos_edge_index[1]])
 
     return batch
 
-def train_link_prediction(model, optimizer, criterion, device, paper_loader, label_loader, train_data_LP, neg_pos_ratio, num_classes, embedding_size):
+def train_link_prediction(model, optimizer, criterion, device, paper_loader, label_loader, train_data_LP, neg_pos_ratio, num_classes, embedding_size, total_paper_nodes):
     total_loss = 0
     model.train()
-    #breakpoint()
     for batch in paper_loader:
         batch = convert_batch_edges(batch, True, neg_pos_ratio)
         batch.to(device)
         optimizer.zero_grad()
-        z_dict = model(batch.x_dict, batch.edge_index_dict)
-        z_paper = z_dict['paper'][:batch['paper'].batch_size]
-        label_embs = embed_labels(model, label_loader, num_classes, embedding_size, device)
+        z_dict = model(batch.x, batch.edge_index)
+        z_paper = z_dict[:batch.batch_size]  
+        label_embs = embed_labels(model, label_loader, num_classes, embedding_size, device, total_paper_nodes)
 
-        pos_edge_index = batch['paper', 'is', 'label'].edge_label_index
-        pos_pred = model.decode_with_embs(z_paper, label_embs, pos_edge_index)
+        pos_edge_index = batch.edge_label_index
+        pos_pred = model.decode_with_embs(z_paper, label_embs, pos_edge_index, total_paper_nodes)
 
         neg_edge_index = None
         if neg_pos_ratio > -1:
             neg_edge_index = negative_sampling(
                 edge_index=pos_edge_index,
-                num_nodes=(batch['paper'].batch_size, batch['label'].n_id.size(0)),
+                num_nodes=(batch.batch_size, num_classes),
                 num_neg_samples=neg_pos_ratio*pos_edge_index.size(1),
                 method='sparse'
             )
-        else:
-            neg_edge_index = batch['paper', 'is', 'label'].neg_edge_index
+        neg_edge_index[1] += total_paper_nodes
+        
 
-        neg_pred = model.decode_with_embs(z_paper, label_embs, neg_edge_index)
+        neg_pred = model.decode_with_embs(z_paper, label_embs, neg_edge_index, total_paper_nodes)
         pos_loss = criterion(pos_pred, torch.ones_like(pos_pred))
         neg_loss = criterion(neg_pred, torch.zeros_like(neg_pred))
         loss = pos_loss + neg_loss
@@ -306,32 +311,31 @@ def train_link_prediction(model, optimizer, criterion, device, paper_loader, lab
     return total_loss/len(paper_loader)
 
 
-def evaluate_link_prediction(model, device, loader, train_data_LP, neg_pos_ratio, label_loader, num_classes, embedding_size):
+def evaluate_link_prediction(model, device, loader, train_data_LP, neg_pos_ratio, label_loader, num_classes, embedding_size, total_paper_nodes):
     model.eval()
-    total_precision = 0
 
     label_embeddings = embed_labels(
         model, 
         label_loader, 
         num_classes, 
         embedding_size, 
-        device
+        device,
+        total_paper_nodes
     )
     with torch.no_grad():
         correct=total=0
         for batch in loader:
             batch = convert_batch_edges(batch, False, neg_pos_ratio)
             batch.to(device)
-            z_dict = model(batch.x_dict, batch.edge_index_dict)
-            paper_embeddings = z_dict['paper'][:batch["paper"].batch_size]
-            z_paper = paper_embeddings.unsqueeze(1)
+            z_dict = model(batch.x, batch.edge_index)
+            z_paper = z_dict[:batch.batch_size]
             z_label = label_embeddings.unsqueeze(0)
-            x = z_paper * z_label
+            x = z_paper.unsqueeze(1) * z_label
             x = x.view(-1, x.size(-1))
             pred_scores = model.decoder.lin(x)
             pred_scores = pred_scores.view(z_paper.size(0), z_label.size(1))
             predicted_labels = pred_scores.argmax(dim=1)
-            true_labels = batch['paper'].y[:batch['paper'].batch_size]
+            true_labels = batch.y[:batch.batch_size].to(device)
             correct += (predicted_labels == true_labels).sum().item()
             total   += true_labels.size(0)
     return correct/total
@@ -396,6 +400,8 @@ def main():
     if ds == 'OGBN':
         og_data.y = og_data.y.squeeze()
     og_data = T.ToUndirected()(og_data)
+    total_paper_nodes = og_data.x.size(0)
+
     
     test_prec_NC = []
     test_prec_LP = []
@@ -450,7 +456,7 @@ def main():
         best_val_nc = 0
         best_test_prec_nc = 0
 
-        for epoch in range(1, num_epochs + 1):
+        for epoch in range(1, 0 + 1):
             loss_nc = train_node_classification(model_NC, data, optimizer_NC, criterion_NC, loader_nc_train, device)
             train_prec = evaluate_node_classification(model_NC, data, data.train_mask, og_data, loader_nc_train, device)
             val_prec = evaluate_node_classification(model_NC, data, data.val_mask, og_data, loader_nc_val, device)
@@ -472,57 +478,70 @@ def main():
                 print('Early stopping due to no improvement in validation Acc.')
                 break
 
-        print(f"NC Test Acc score for seed {seed}: {best_test_prec_nc:.4f}")
+        print(f"NC Test Acc for seed {seed}: {best_test_prec_nc:.4f}")
         test_prec_NC.append(best_test_prec_nc)
 
         train_data_LP, val_data_LP, test_data_LP = prepare_lp_data(data, data.train_mask, data.val_mask, data.test_mask, device, num_classes, msg_split_ratio, neg_pos_ratio)
-        n_hop = 10
-        num_neighbors_LP = {key: [10, 5, 5] for key in train_data_LP.edge_types}
-
-        label_node_ids = torch.arange(num_classes)
         
+        data.train_mask = torch.cat([data.train_mask, torch.zeros(num_classes, dtype=torch.bool)])
+        data.val_mask = torch.cat([data.val_mask, torch.zeros(num_classes, dtype=torch.bool)])
+        data.test_mask = torch.cat([data.test_mask, torch.zeros(num_classes, dtype=torch.bool)])
+        data.label_mask = torch.cat([torch.zeros(total_paper_nodes, dtype=torch.bool), torch.ones(num_classes, dtype=torch.bool)])
+
+        label_node_idx = torch.arange(total_paper_nodes,
+                              total_paper_nodes + num_classes)
+
         label_loader = NeighborLoader(
-            train_data_LP,
-            input_nodes=('label', label_node_ids),
-            num_neighbors=[10,5,5],
+            train_data_LP,                
+            num_neighbors=num_neighbors_NC,
             batch_size=batch_size,
+            input_nodes=label_node_idx,   
             shuffle=False,
-            num_workers=4,
+            num_workers=num_workers,
             persistent_workers=True
         )
 
+        total_y = torch.cat([
+            data.y,                                
+            torch.full((num_classes,), -1)         
+        ])
+
+        train_data_LP.y = total_y
+        val_data_LP.y   = total_y
+        test_data_LP.y  = total_y
+
+
         loader_lp_train = NeighborLoader(
-                train_data_LP,
-                num_neighbors=num_neighbors_LP,
-                batch_size=batch_size,
-                input_nodes=('paper', train_data_LP['paper'].sup_mask),
-                shuffle=True,
-                num_workers=num_workers,
-                persistent_workers=True
-            )
-    
+            train_data_LP,                   
+            num_neighbors=num_neighbors_NC,
+            batch_size=batch_size,
+            input_nodes=torch.where(data.train_mask)[0],   
+            shuffle=True,
+            num_workers=num_workers,
+            persistent_workers=True
+        )
+
         loader_lp_val = NeighborLoader(
-                val_data_LP,
-                num_neighbors=num_neighbors_LP,
-                batch_size=batch_size,
-                input_nodes=('paper', data.val_mask),
-                shuffle=True,
-                num_workers=num_workers,
-                persistent_workers=True
-            )
-        
+            val_data_LP,                     
+            num_neighbors=num_neighbors_NC,
+            batch_size=batch_size,
+            input_nodes=torch.where(data.val_mask)[0],
+            shuffle=False,
+            num_workers=num_workers,
+            persistent_workers=True
+        )
+
         loader_lp_test = NeighborLoader(
-                test_data_LP,
-                num_neighbors=num_neighbors_LP,
-                batch_size=batch_size,
-                input_nodes=('paper', data.test_mask),
-                shuffle=True,
-                num_workers=num_workers,
-                persistent_workers=True
-            )
+            test_data_LP,                    
+            num_neighbors=num_neighbors_NC,
+            batch_size=batch_size,
+            input_nodes=torch.where(data.test_mask)[0],
+            shuffle=False,
+            num_workers=num_workers,
+            persistent_workers=True
+        )
     
-        metadata = train_data_LP.metadata()
-        model_LP = LinkPredictor(hidden_channels, embedding_size, metadata, two_layers).to(device)
+        model_LP = LinkPredictor(hidden_channels, embedding_size, two_layers).to(device)
         optimizer_LP = torch.optim.Adam(model_LP.parameters(), lr=lr_LP)
         criterion_LP = torch.nn.BCEWithLogitsLoss()
 
@@ -531,10 +550,10 @@ def main():
         patience = start_patience
 
         for epoch in range(1, num_epochs + 1):
-            loss_lp = train_link_prediction(model_LP, optimizer_LP, criterion_LP, device, loader_lp_train, label_loader, train_data_LP, neg_pos_ratio, num_classes, embedding_size)
-            train_prec = evaluate_link_prediction(model_LP, device, loader_lp_train, train_data_LP, neg_pos_ratio, label_loader, num_classes, embedding_size)
-            val_prec = evaluate_link_prediction(model_LP, device, loader_lp_val, val_data_LP, neg_pos_ratio, label_loader, num_classes, embedding_size)
-            test_prec = evaluate_link_prediction(model_LP, device, loader_lp_test, test_data_LP, neg_pos_ratio, label_loader, num_classes, embedding_size)
+            loss_lp = train_link_prediction(model_LP, optimizer_LP, criterion_LP, device, loader_lp_train, label_loader, train_data_LP, neg_pos_ratio, num_classes, embedding_size, total_paper_nodes)
+            train_prec = evaluate_link_prediction(model_LP, device, loader_lp_train, train_data_LP, neg_pos_ratio, label_loader, num_classes, embedding_size, total_paper_nodes)
+            val_prec = evaluate_link_prediction(model_LP, device, loader_lp_val, val_data_LP, neg_pos_ratio, label_loader, num_classes, embedding_size, total_paper_nodes)
+            test_prec = evaluate_link_prediction(model_LP, device, loader_lp_test, test_data_LP, neg_pos_ratio, label_loader, num_classes, embedding_size, total_paper_nodes)
             
             if print_epochs:
                 print(f'Epoch: {epoch:03d}, '
