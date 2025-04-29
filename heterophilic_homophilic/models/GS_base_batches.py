@@ -457,7 +457,7 @@ def main():
         best_val_nc = 0
         best_test_prec_nc = 0
 
-        for epoch in range(1, num_epochs + 1):
+        for epoch in range(1, 0 + 1):
             loss_nc = train_node_classification(model_NC, data, optimizer_NC, criterion_NC, loader_nc_train, device)
             train_prec = evaluate_node_classification(model_NC, data, data.train_mask, og_data, loader_nc_train, device)
             val_prec = evaluate_node_classification(model_NC, data, data.val_mask, og_data, loader_nc_val, device)
