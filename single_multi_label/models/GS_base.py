@@ -6,13 +6,16 @@ import torch
 import torch_geometric.transforms as T
 from torch_geometric.data import HeteroData
 from torch_geometric.transforms import RandomNodeSplit
+from preprocess_data import load_blog, load_dblp
+from torch_geometric.datasets import Yelp
 from torch_geometric.nn import SAGEConv, to_hetero
 import time
 import json
+import torch.nn.functional as F
 from torch_geometric.utils import negative_sampling
-from preprocess_data import load_blog, load_dblp
-from torch_geometric.datasets import Yelp
+from torch_geometric.data import Data
 from sklearn.metrics import average_precision_score
+
 
 
 def parse_args():
@@ -26,10 +29,12 @@ def parse_args():
     parser.add_argument("--save_results", type=bool, default=False, help="Set to True if results and config should be saved in runs dir)")
     parser.add_argument("--two_layers", type=bool, default=False, help="Set to True if you want 2 layers instead of 3 in the models")
     parser.add_argument("--msg_split_ratio", type=float, default=0.3, help="Fraction of message passing edges in training for LP (the rest become supervision edges)")
-    parser.add_argument("--ds", type=str, default='blog', help="Which dataset to run on.")
+    parser.add_argument("--ds", type=str, default='CiteSeer', help="Which dataset to run on.")
     parser.add_argument("--neg_pos_ratio", type=int, default=-1, help="How many times the amount of positive edges should the amount of negative edges be? -1 if all negative edges should be used")
     parser.add_argument("--print_epochs", type=bool, default=False, help="Should epoch scores be printed (True) or not (False)?")
 
+
+    
     return parser.parse_known_args()[0]
 
 def setup_determinism(seed):
@@ -43,7 +48,6 @@ def setup_determinism(seed):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
     os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
-
 
 def ap_score(y_true, y_pred):
 
@@ -107,91 +111,103 @@ def evaluate_node_classification(model, data, mask, og_data):
 
     return precision.item()
 
-def get_per_class_acc_nc(model, data, mask, og_data, num_classes, device):
-    model.eval()
-    with torch.no_grad():
-        out = model(data.x, data.edge_index)
-        pred = out.argmax(dim=-1)
-
-        per_class_acc = torch.zeros(num_classes,dtype=torch.float, device=device)
-        for c in range(num_classes):
-            correct_in_class = ((pred[mask] == og_data.y[mask].to(pred.device)) & (og_data.y[mask].to(pred.device)==c)).sum()
-            total_in_class = (og_data.y[mask] == c).sum()
-            per_class_acc[c] = correct_in_class.float()/total_in_class
-    return per_class_acc
-
-
-def sub_data(data, mask, device):
-    s_data = HeteroData()
-    s_data['paper'].x = data.x
-    s_data['paper', 'cites', 'paper'].edge_index = data.edge_index
+def add_label_edges(data, device):
     num_labels = data.y.size(1)
-    s_data['label'].x = torch.eye(num_labels, dtype=torch.float32, device=device)
-    mask_indices = torch.nonzero(mask, as_tuple=False).flatten()#nodes that will be wired
-    mask_y = data.y[mask_indices]
-    num_edges_to_create = int(mask_y.sum().item())
-    label_edges = torch.zeros((2, num_edges_to_create), dtype=torch.int64, device=device)
-    curr = 0 #array pointer
-    for i in range(len(mask_indices)):
-        for j in range(num_labels):
-            if mask_y[i, j] == 1:
-                label_edges[0, curr] = mask_indices[i]
-                label_edges[1, curr] = j
-                curr += 1
-    s_data['paper', 'is', 'label'].edge_index = label_edges
-    return s_data
+    num_nodes = data.x.size(0)
+    feature_size = data.x.size(1)
+    num_og_edges = data.edge_index.size(1)
 
-def split_train_edges(data, split_ratio):
-    total_edges = data['paper', 'is', 'label'].edge_index.size(1)
-    num_msg_edges = int(total_edges * split_ratio)
-    perm = torch.randperm(total_edges)
-    msg_edges = perm[:num_msg_edges]
-    sup_edges = perm[num_msg_edges:]
-    msg_edge_index = data['paper', 'is', 'label'].edge_index[:, msg_edges]
-    sup_edge_index = data['paper', 'is', 'label'].edge_index[:, sup_edges]
-    return msg_edge_index, sup_edge_index
+    # initialize label nodes as one hot vectors
+    a = torch.eye(num_labels)
+    b = torch.zeros((num_labels, feature_size-num_labels))
+    M = torch.cat([a, b], dim=1)
+    total_x = torch.cat([data.x, M], dim=0)
+    
+    # append edges between normal nodes and label nodes
+    indices = torch.nonzero(data.y, as_tuple=False)
+    src = indices[:, 0]
+    dst = indices[:, 1] + num_nodes
+    label_edges = torch.stack([src, dst], dim=0).long()
 
-def my_negative_sampling(pos_edge_index, num_paper_nodes, num_classes, device):
-    neg_edge_index = torch.zeros((2, num_paper_nodes * (num_classes - 1)), device=device)
+    total_edge_index = torch.cat([data.edge_index, label_edges], dim=1)
+
+    s_data = Data(x=total_x, edge_index=total_edge_index)
+    return s_data, num_og_edges, num_nodes
+
+def split_train_edges(data, train_node_mask, num_og_edges, num_label_edges, msg_split_ratio):
+    total_edges   = num_og_edges + num_label_edges
+    label_start   = num_og_edges
+    label_end     = total_edges
+    
+    label_idx     = torch.arange(label_start, label_end, device=data.edge_index.device)
+    paper_of_edge = data.edge_index[0, label_idx]
+
+    train_label_idx = label_idx[train_node_mask[paper_of_edge]]
+
+    num_train_label = train_label_idx.numel()
+    num_msg         = int(num_train_label * msg_split_ratio)
+
+    perm = train_label_idx[torch.randperm(num_train_label)]
+    msg_idx = perm[:num_msg]
+    sup_idx = perm[num_msg:]
+
+    msg_mask = torch.zeros(total_edges, dtype=torch.bool, device=data.edge_index.device)
+    sup_mask = torch.zeros_like(msg_mask)
+
+    msg_mask[:num_og_edges] = True      
+    msg_mask[msg_idx] = True 
+    sup_mask[sup_idx] = True
+
+    return msg_mask, sup_mask
+
+def my_negative_sampling(pos_edge_index, total_paper_nodes, num_classes, device):
+    # use all negative edges!
+    num_sup_nodes = pos_edge_index.size(1)
+    neg_edge_index = torch.zeros((2, num_sup_nodes * (num_classes - 1)), device=device)
     neg_edge_index[0, :] = pos_edge_index[0].repeat_interleave(num_classes - 1)
     labels = torch.arange(num_classes, device=device)
     
-    for i in range(num_paper_nodes):
-        positive_label = pos_edge_index[1, i].item()
-        remaining_labels = labels[labels != positive_label]
+    for i in range(num_sup_nodes):
+        positive_label = pos_edge_index[1, i].item()-total_paper_nodes
+        remaining_labels = labels[labels != positive_label]+total_paper_nodes
         neg_edge_index[1, i * (num_classes - 1):(i + 1) * (num_classes - 1)] = remaining_labels
+
     return neg_edge_index.to(torch.int32)
 
+
 def prepare_lp_data(data, train_mask, val_mask, test_mask, device, num_classes, msg_split_ratio, neg_pos_ratio):
-    train_data_LP = sub_data(data, train_mask, device)
-    val_data_LP = sub_data(data, val_mask, device)
-    test_data_LP = sub_data(data, test_mask, device)
-    msg_edge_index, sup_edge_index = split_train_edges(train_data_LP, msg_split_ratio)
+    total_paper_nodes = data.x.size(0)
+    data, num_og_edges, num_nodes = add_label_edges(data, device)
+    num_label_edges = data.edge_index.size(1) - num_og_edges
+    msg_edge_mask, sup_edge_mask = split_train_edges(data, train_mask, num_og_edges, num_label_edges, msg_split_ratio)
 
-    train_data_LP['paper', 'is', 'label'].edge_index = msg_edge_index
-    train_data_LP['paper', 'is', 'label'].edge_label_index = sup_edge_index
-    train_data_LP['paper', 'is', 'label'].edge_label = torch.tensor(np.ones((sup_edge_index.size(1))))
+    label_src = data.edge_index[0, num_og_edges:]
 
-    val_data_LP['paper', 'is', 'label'].edge_label_index = val_data_LP['paper', 'is', 'label'].edge_index
-    val_data_LP['paper', 'is', 'label'].edge_index = torch.cat((msg_edge_index, sup_edge_index), 1)
-    val_data_LP['paper', 'is', 'label'].edge_label = torch.tensor(np.ones((val_data_LP['paper', 'is', 'label'].edge_label_index.size(1))))
+    label_val_mask  = val_mask[label_src] 
+    label_test_mask = test_mask[label_src]
 
-    test_data_LP['paper', 'is', 'label'].edge_label_index = test_data_LP['paper', 'is', 'label'].edge_index
-    test_data_LP['paper', 'is', 'label'].edge_index = torch.cat(
-        (msg_edge_index, sup_edge_index, val_data_LP['paper', 'is', 'label'].edge_label_index), 1
-    )
-    test_data_LP['paper', 'is', 'label'].edge_label = torch.tensor(
-        np.ones((test_data_LP['paper', 'is', 'label'].edge_label_index.size(1)))
-    )
+    full_val_mask  = torch.cat([torch.zeros(num_og_edges,  dtype=torch.bool,device=data.edge_index.device),label_val_mask], 0)
+    full_test_mask = torch.cat([torch.zeros(num_og_edges,  dtype=torch.bool,device=data.edge_index.device),label_test_mask], 0)
+
+    train_data_LP = Data(x=data.x, edge_index=data.edge_index[:, msg_edge_mask])
+    train_data_LP.edge_label_index = data.edge_index[:, sup_edge_mask]
+    train_data_LP.edge_label = torch.ones(train_data_LP.edge_label_index.size(0))
+
+    val_data_LP = Data(x=data.x, edge_index=torch.cat([train_data_LP.edge_index, train_data_LP.edge_label_index], dim=1))
+    val_data_LP.edge_label_index = data.edge_index[:, full_val_mask]
+    val_data_LP.edge_label = torch.ones(val_data_LP.edge_label_index.size(0))
+
+    test_data_LP = Data(x=data.x, edge_index=torch.cat([val_data_LP.edge_index, val_data_LP.edge_label_index], dim=1))
+    test_data_LP.edge_label_index = data.edge_index[:, full_test_mask]
+    test_data_LP.edge_label = torch.ones(test_data_LP.edge_label_index.size(0))
+
     if neg_pos_ratio == -1:
         # remember: negative sampling can be here because we use ALL possible negative edges everytime, so the sampling will be the same for each seed
         # if we run on a big dataset where we cannot use all possible negative edges, we need to sample in the training method instead, once every epoch
-        train_data_LP['paper', 'is', 'label'].neg_edge_index = my_negative_sampling(train_data_LP['paper', 'is', 'label'].edge_label_index, train_data_LP['paper', 'is', 'label'].edge_label_index.size(1), num_classes, device)
-
+        train_data_LP.neg_edge_index = my_negative_sampling(data.edge_index[:,sup_edge_mask], total_paper_nodes, num_classes, device)
     train_data_LP = T.ToUndirected()(train_data_LP)
     val_data_LP = T.ToUndirected()(val_data_LP)
     test_data_LP = T.ToUndirected()(test_data_LP)
-
     return train_data_LP, val_data_LP, test_data_LP
 
 class EdgeDecoder(torch.nn.Module):
@@ -205,42 +221,31 @@ class EdgeDecoder(torch.nn.Module):
         return out
 
 class LinkPredictor(torch.nn.Module):
-    def __init__(self, hidden_channels, embedding_size, metadata, two_layers):
+    def __init__(self, hidden_channels, embedding_size, two_layers):
         super().__init__()
         self.encoder = GraphSAGE(hidden_channels, embedding_size, two_layers)
-        self.encoder = to_hetero(self.encoder, metadata)
         self.decoder = EdgeDecoder(embedding_size)
 
     def forward(self, x_dict, edge_index_dict):
         z_dict = self.encoder(x_dict, edge_index_dict)
         return z_dict
 
-    def decode(self, z_dict, edge_label_index):
-        z_paper = z_dict['paper']
-        z_label = z_dict['label']
+    def decode(self, z_dict, edge_label_index, total_paper_nodes, num_classes):
+        z_paper = z_dict[:total_paper_nodes,:]
+        z_label = z_dict[-num_classes:,:]
         src, dst = edge_label_index
-        out = self.decoder(z_paper[src], z_label[dst])
+        out = self.decoder(z_paper[src], z_label[dst-total_paper_nodes])
         return out
 
 
-def train_link_prediction(model, data, optimizer, criterion, num_classes, device, neg_pos_ratio):
+def train_link_prediction(model, data, optimizer, criterion, num_classes, device, neg_pos_ratio, total_paper_nodes):
     model.train()
     optimizer.zero_grad()
-    z_dict = model(data.x_dict, data.edge_index_dict)
-    pos_edge_index = data['paper', 'is', 'label'].edge_label_index
-    pos_pred = model.decode(z_dict, pos_edge_index)
-    neg_edge_index = None
-    if neg_pos_ratio > -1:
-        neg_edge_index = negative_sampling(
-            edge_index=pos_edge_index,
-            num_nodes=(data['paper'].num_nodes, data['label'].num_nodes),
-            num_neg_samples=neg_pos_ratio*pos_edge_index.size(1),
-            method='sparse'
-        )
-    else:
-        neg_edge_index = data['paper', 'is', 'label'].neg_edge_index
-
-    neg_pred = model.decode(z_dict, neg_edge_index)
+    z_dict = model(data.x, data.edge_index)
+    pos_edge_index = data.edge_label_index
+    pos_pred = model.decode(z_dict, pos_edge_index, total_paper_nodes, num_classes)
+    neg_edge_index = data.neg_edge_index
+    neg_pred = model.decode(z_dict, neg_edge_index, total_paper_nodes, num_classes)
     pos_loss = criterion(pos_pred, torch.ones_like(pos_pred))
     neg_loss = criterion(neg_pred, torch.zeros_like(neg_pred))
     loss = pos_loss + neg_loss
@@ -248,12 +253,13 @@ def train_link_prediction(model, data, optimizer, criterion, num_classes, device
     optimizer.step()
     return loss.item()
 
-def evaluate_link_prediction(model, data, mask, og_data):
+
+def evaluate_link_prediction(model, data, mask, og_data, total_paper_nodes, num_classes):
     model.eval()
     with torch.no_grad():
-        z_dict = model(data.x_dict, data.edge_index_dict)
-        paper_embeddings = z_dict['paper'][mask]
-        label_embeddings = z_dict['label']
+        z_dict = model(data.x, data.edge_index)
+        paper_embeddings = z_dict[:total_paper_nodes,:][mask]
+        label_embeddings = z_dict[-num_classes:,:]
         z_paper = paper_embeddings.unsqueeze(1)
         z_label = label_embeddings.unsqueeze(0)
         x = z_paper * z_label
@@ -265,35 +271,16 @@ def evaluate_link_prediction(model, data, mask, og_data):
         precision = ap_score(true_labels, pred_probs)
 
     return precision.item()
-
-
-class HeteroNCModel(torch.nn.Module):
-    def __init__(self, hidden_channels, embedding_size, num_classes, metadata, two_layers):
-        super().__init__()
-        self.hetero_encoder = to_hetero(
-            GraphSAGE(hidden_channels, embedding_size, two_layers),
-            metadata
-        )
-        self.paper_classifier = torch.nn.Linear(embedding_size, num_classes)
-        
-    def forward(self, x_dict, edge_index_dict):
-        z_dict = self.hetero_encoder(x_dict, edge_index_dict)
-        
-        z_paper = z_dict['paper']     
-        
-        out_paper = self.paper_classifier(z_paper)
-        
-        return {'paper': out_paper}
     
 
-def save_run(test_prec_NC, test_prec_LP, hidden_channels, embedding_size, num_epochs, lr_NC, lr_LP, num_seeds, two_layers, msg_split_ratio, ds, neg_pos_ratio):
+def save_run(test_acc_NC, test_acc_LP, hidden_channels, embedding_size, num_epochs, lr_NC, lr_LP, num_seeds, two_layers, msg_split_ratio, ds, neg_pos_ratio):
     run_name = time.strftime("%Y%m%d_%H%M%S")
     save_path = os.path.join("runs", "GS_"+ds, run_name)
     if not os.path.isdir(save_path):
         os.makedirs(save_path)
     
-    np.save(os.path.join(save_path, 'test_acc_NC'), test_prec_NC)
-    np.save(os.path.join(save_path, 'test_acc_LP'), test_prec_LP)
+    np.save(os.path.join(save_path, 'test_acc_NC'), test_acc_NC)
+    np.save(os.path.join(save_path, 'test_acc_LP'), test_acc_LP)
 
     config = {'hidden_channels': hidden_channels, 'embedding_size': embedding_size, 'num_epochs': num_epochs, 'lr_NC': lr_NC, 'lr_LP': lr_LP, 'num_seeds': num_seeds, 'two_layers': two_layers, 'msg_split_ratio': msg_split_ratio, 'dataset': ds, 'neg_pos_ratio': neg_pos_ratio}
     with open(os.path.join(save_path, "config.json"), "w") as outfile: 
@@ -334,62 +321,45 @@ def main():
         return
     
     print("Running GS on dataset:", ds)
-    
 
     og_data = dataset
     og_data = T.ToUndirected()(og_data).to(device)
+    total_paper_nodes = og_data.x.size(0)
     
-    test_prec_NC = []
-    test_prec_LP = []
+    test_acc_NC = []
+    test_acc_LP = []
     
     for seed in seed_list:
         print(f"Running for seed {seed}")
         
         setup_determinism(seed)
-        
-        data = og_data.clone()
-
-        if ds == 'blog':
-            if seed == 1:
-                split_dict = torch.load("data/blog/split_0.pt")
-            elif seed == 2:
-                split_dict = torch.load("data/blog/split_1.pt")
-            elif seed == 3:
-                split_dict = torch.load("data/blog/split_2.pt")
-
-            data.train_mask = split_dict['train_mask']
-            data.val_mask = split_dict['val_mask']
-            data.test_mask = split_dict['test_mask']
-        else:
-            transform = RandomNodeSplit(num_val=0.1, num_test=0.1)
-            data = transform(data)
-
-
+    
+        transform = RandomNodeSplit(num_val=0.1, num_test=0.1)
+        data = transform(og_data.clone()).to(device)
         num_classes = data.y.size(1)
     
-        model_NC = GraphSAGE_NC(hidden_channels, embedding_size, num_classes,two_layers).to(device)
+        model_NC = GraphSAGE_NC(hidden_channels, embedding_size, num_classes ,two_layers).to(device)
         optimizer_NC = torch.optim.Adam(model_NC.parameters(), lr=lr_NC)
         criterion_NC = torch.nn.BCEWithLogitsLoss()
     
         start_patience = 100
-        patience = start_patience
         best_val_nc = 0
-        best_test_prec_nc = 0
+        best_test_nc = 0
 
-        for epoch in range(1, num_epochs + 1):
+        for epoch in range(1, 1 + num_epochs):
             loss_nc = train_node_classification(model_NC, data, optimizer_NC, criterion_NC)
-            train_prec = evaluate_node_classification(model_NC, data, data.train_mask, og_data)
-            val_prec = evaluate_node_classification(model_NC, data, data.val_mask, og_data)
-            test_prec = evaluate_node_classification(model_NC, data, data.test_mask, og_data)
+            train_nc = evaluate_node_classification(model_NC, data, data.train_mask, og_data)
+            val_nc = evaluate_node_classification(model_NC, data, data.val_mask, og_data)
+            test_nc = evaluate_node_classification(model_NC, data, data.test_mask, og_data)
             if print_epochs:
                 print(f'Epoch: {epoch:03d}, '
                       f'Loss: {loss_nc:.4f}, '
-                      f'Train Acc: {train_prec:.4f}, '
-                      f'Val Acc: {val_prec:.4f}, '
-                      f'Test Acc: {test_prec:.4f}')
-            if val_prec > best_val_nc:
-                best_val_nc = val_prec
-                best_test_prec_nc = test_prec
+                      f'Train Acc: {train_nc:.4f}, '
+                      f'Val Acc: {val_nc:.4f}, '
+                      f'Test Acc: {test_nc:.4f}')
+            if val_nc > best_val_nc:
+                best_val_nc = val_nc
+                best_test_nc = test_nc
                 patience = start_patience
             else:
                 patience -= 1
@@ -398,38 +368,31 @@ def main():
                 print('Early stopping due to no improvement in validation accuracy.')
                 break
 
-        print(f"NC Test Accuracy for seed {seed}: {best_test_prec_nc:.4f}")
-        test_prec_NC.append(best_test_prec_nc)
-
+        print(f"NC Test Accuracy for seed {seed}: {best_test_nc:.4f}")
+        test_acc_NC.append(best_test_nc)
         train_data_LP, val_data_LP, test_data_LP = prepare_lp_data(data, data.train_mask, data.val_mask, data.test_mask, device, num_classes, msg_split_ratio, neg_pos_ratio)
-    
-        train_data_LP = train_data_LP.to(device)
-        val_data_LP = val_data_LP.to(device)
-        test_data_LP = test_data_LP.to(device)
-    
-        metadata = train_data_LP.metadata()
-        model_LP = LinkPredictor(hidden_channels, embedding_size, metadata, two_layers).to(device)
+        
+        model_LP = LinkPredictor(hidden_channels, embedding_size, two_layers).to(device)
         optimizer_LP = torch.optim.Adam(model_LP.parameters(), lr=lr_LP)
         criterion_LP = torch.nn.BCEWithLogitsLoss()
 
         best_val_lp = 0
-        best_test_prec_lp = 0
-        patience = start_patience
+        best_test_lp = 0
 
         for epoch in range(1, num_epochs + 1):
-            loss_lp = train_link_prediction(model_LP, train_data_LP, optimizer_LP, criterion_LP, num_classes, device, neg_pos_ratio)
-            train_prec = evaluate_link_prediction(model_LP, train_data_LP, data.train_mask, og_data)
-            val_prec = evaluate_link_prediction(model_LP, val_data_LP, data.val_mask, og_data)
-            test_prec = evaluate_link_prediction(model_LP, test_data_LP, data.test_mask, og_data)
+            loss_lp = train_link_prediction(model_LP, train_data_LP, optimizer_LP, criterion_LP, num_classes, device, neg_pos_ratio, total_paper_nodes)
+            train_lp = evaluate_link_prediction(model_LP, train_data_LP, data.train_mask, og_data, total_paper_nodes, num_classes)
+            val_lp = evaluate_link_prediction(model_LP, val_data_LP, data.val_mask, og_data, total_paper_nodes, num_classes)
+            test_lp = evaluate_link_prediction(model_LP, test_data_LP, data.test_mask, og_data, total_paper_nodes, num_classes)
             if print_epochs:
                 print(f'Epoch: {epoch:03d}, '
                       f'Loss: {loss_lp:.4f}, '
-                      f'Train Acc: {train_prec:.4f}, '
-                      f'Val Acc: {val_prec:.4f}, '
-                      f'Test Acc: {test_prec:.4f}')
-            if val_prec > best_val_lp:
-                best_val_lp = val_prec
-                best_test_prec_lp = test_prec
+                      f'Train Acc: {train_lp:.4f}, '
+                      f'Val Acc: {val_lp:.4f}, '
+                      f'Test Acc: {test_lp:.4f}')
+            if val_lp > best_val_lp:
+                best_val_lp = val_lp
+                best_test_lp = test_lp
                 patience = start_patience
             else:
                 patience -= 1
@@ -438,11 +401,11 @@ def main():
                 print('Early stopping due to no improvement in validation accuracy.')
                 break
 
-        test_prec_LP.append(best_test_prec_lp)
-        print(f"LP Test Accuracy for seed {seed}: {best_test_prec_lp:.4f}\n")
+        test_acc_LP.append(best_test_lp)
+        print(f"LP Test Accuracy for seed {seed}: {best_test_lp:.4f}\n")
         
     if save_results:
-        save_run(test_prec_NC, test_prec_LP, hidden_channels, embedding_size, num_epochs, lr_NC, lr_LP, num_seeds, two_layers, msg_split_ratio, ds, neg_pos_ratio)
+        save_run(test_acc_NC, test_acc_LP, hidden_channels, embedding_size, num_epochs, lr_NC, lr_LP, num_seeds, two_layers, msg_split_ratio, ds, neg_pos_ratio)
 
 if __name__=="__main__":
     main()
