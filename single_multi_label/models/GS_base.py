@@ -118,8 +118,8 @@ def add_label_edges(data, device):
     num_og_edges = data.edge_index.size(1)
 
     # initialize label nodes as one hot vectors
-    a = torch.eye(num_labels)
-    b = torch.zeros((num_labels, feature_size-num_labels))
+    a = torch.eye(num_labels, device=device)
+    b = torch.zeros((num_labels, feature_size-num_labels), device=device)
     M = torch.cat([a, b], dim=1)
     total_x = torch.cat([data.x, M], dim=0)
     
