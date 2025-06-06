@@ -4,6 +4,7 @@ import random
 import numpy as np
 import torch
 import torch_geometric.transforms as T
+from ogb.nodeproppred import PygNodePropPredDataset
 from torch_geometric.transforms import RandomNodeSplit
 from torch_geometric.datasets import CitationFull
 from torch_geometric.datasets import WikipediaNetwork
@@ -16,10 +17,10 @@ import json
 
 def parse_args():
     parser = argparse.ArgumentParser(description="NC/LP Model Hyperparameters")
-    parser.add_argument("--num_seeds", type=int, default=50, help="Number of random seeds to run (starting from 1).")
+    parser.add_argument("--num_seeds", type=int, default=10, help="Number of random seeds to run (starting from 1).")
     parser.add_argument("--save_results", type=bool, default=False, help="Set to True if results and config should be saved in runs dir)")
     parser.add_argument("--ds", type=str, default='Cora_ML', help="Which dataset to run on.")
-    parser.add_argument("--num_layers", type=int, default=15,help="# propagation steps (depth)")
+    parser.add_argument("--num_layers", type=int, default=3,help="# propagation steps (depth)")
     parser.add_argument("--alpha", type=float, default=0.8,help="restart probability (1-alpha)")
 
     return parser.parse_known_args()[0]
@@ -75,6 +76,8 @@ def main():
         dataset = HeterophilousGraphDataset(root='../data/RomanEmpire', name='Roman-empire')
     elif ds == 'Squirrel':
         dataset = WikipediaNetwork(root='../data/squirrel', name='squirrel')
+    elif ds == 'OGBN':
+        dataset = PygNodePropPredDataset(name='ogbn-arxiv', root='../data/ogbn_arxiv')
     else:
         print("Invalid dataset name.")
         return
@@ -122,15 +125,23 @@ def main():
         
         train_label_edges = torch.zeros((2, num_train), dtype=torch.int64)
         train_label_edges[0] = data.train_mask.nonzero(as_tuple=True)[0]
-        train_label_edges[1] = data.y[data.train_mask] + num_nodes
-        data.edge_index = torch.cat([data.edge_index, train_label_edges], dim=1)
-        data.edge_index = torch.cat([data.edge_index, train_label_edges.flip(0)], dim=1) #undirected
-        
-        data.train_mask = torch.cat((data.train_mask, torch.zeros(num_classes, dtype=torch.bool))) # change to ones here if label nodes should be included 
-        data.val_mask = torch.cat((data.val_mask, torch.zeros(num_classes, dtype=torch.bool)))
-        data.test_mask = torch.cat((data.test_mask, torch.zeros(num_classes, dtype=torch.bool)))
+        if ds == 'OGBN':
+            train_label_edges[1] = data.y[data.train_mask].squeeze() + num_nodes
+        else:
+            train_label_edges[1] = data.y[data.train_mask] + num_nodes
 
-        data.y = torch.cat((data.y, torch.arange(0, num_classes)))
+        data.edge_index = torch.cat([data.edge_index, train_label_edges.to(device)], dim=1)
+        data.edge_index = torch.cat([data.edge_index, train_label_edges.flip(0).to(device)], dim=1) #undirected
+
+        label_nodes_mask = torch.zeros(num_classes, dtype=torch.bool).to(device)
+        data.train_mask = torch.cat((data.train_mask, label_nodes_mask)) # change to ones here if label nodes should be included
+        data.val_mask = torch.cat((data.val_mask, label_nodes_mask))
+        data.test_mask = torch.cat((data.test_mask, label_nodes_mask))
+
+        if ds == 'OGBN':
+            data.y = torch.cat((data.y, torch.arange(0, num_classes).unsqueeze(1).to(device)))
+        else:
+            data.y = torch.cat((data.y, torch.arange(0, num_classes).to(device)))
 
         logits_LP = lpa(data.y, data.edge_index, mask=data.train_mask)
         preds_LP = logits_LP.argmax(dim=-1)

@@ -14,10 +14,10 @@ from torch_geometric.datasets import Yelp
 
 def parse_args():
     p = argparse.ArgumentParser("Multi-label LPA baseline")
-    p.add_argument("--num_seeds", type=int, default=1)
+    p.add_argument("--num_seeds", type=int, default=10)
     p.add_argument("--save_results", type=bool, default=False)
     p.add_argument("--ds", type=str, default="blog", choices=["blog", "DBLP", "Yelp"])
-    p.add_argument("--num_layers", type=int, default=15)
+    p.add_argument("--num_layers", type=int, default=3)
     p.add_argument("--alpha", type=float, default=0.8)
     return p.parse_args()
 
@@ -60,6 +60,8 @@ def save_run(test_ap_NC, test_ap_LP, args):
 def main():
     args = parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if args.ds == 'Yelp':
+        device = 'cpu'
     print("device:", device)
 
     og_data = load_dataset(args.ds)
@@ -94,7 +96,7 @@ def main():
             data.val_mask   = split_masks["val_mask"].to(device)
             data.test_mask  = split_masks["test_mask"].to(device)
         else:
-            data = RandomNodeSplit(num_val=0.1, num_test=0.1)(data)
+            data = RandomNodeSplit(num_val=0.1, num_test=0.1)(data).to(device)
 
         num_classes = data.y.size(1)
 
@@ -114,7 +116,7 @@ def main():
 
         # rewire to LP
 
-        label_node_ids = torch.arange(num_nodes, num_nodes + num_classes, dtype=torch.long)
+        label_node_ids = torch.arange(num_nodes, num_nodes + num_classes, dtype=torch.long).to(device)
         train_idx   = data.train_mask.nonzero(as_tuple=True)[0]
         y_train = data.y[train_idx]
 
