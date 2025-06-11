@@ -110,7 +110,7 @@ def evaluate_node_classification(model, data, mask, og_data):
         true_labels = data.y[mask].float()
         precision = ap_score(true_labels, probs)
 
-    return precision.item()
+    return precision
 
 
 def sub_data(data, mask, device):
@@ -280,7 +280,7 @@ def evaluate_link_prediction(model, data, mask, og_data):
         true_labels = og_data.y[mask].float()
         precision = ap_score(true_labels, pred_probs)
 
-    return precision.item()
+    return precision
 
     
 

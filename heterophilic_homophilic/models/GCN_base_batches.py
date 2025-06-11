@@ -4,6 +4,7 @@ import random
 import numpy as np
 import torch
 import torch_geometric.transforms as T
+from ogb.nodeproppred import PygNodePropPredDataset
 from torch_geometric.data import HeteroData
 from torch_geometric.transforms import RandomNodeSplit
 from torch_geometric.datasets import CitationFull
@@ -121,6 +122,7 @@ def evaluate_node_classification(model, data, mask, og_data, loader, device):
 def sub_data(data, mask, device):
     s_data = HeteroData()
     s_data['paper'].x = data.x
+    s_data['paper'].y = data.y
     s_data['paper', 'cites', 'paper'].edge_index = data.edge_index
     unique_classes = data.y.unique()
     s_data['label'].x = torch.eye(len(unique_classes), dtype=torch.float32, device=device)
@@ -179,6 +181,9 @@ def prepare_lp_data(data, train_mask, val_mask, test_mask, device, num_classes, 
         # remember: negative sampling can be here because we use ALL possible negative edges everytime, so the sampling will be the same for each seed
         # if we run on a big dataset where we cannot use all possible negative edges, we need to sample in the training method instead, once every epoch
         train_data_LP['paper', 'is', 'label'].neg_edge_index = my_negative_sampling(train_data_LP['paper', 'is', 'label'].edge_label_index, train_data_LP['paper', 'is', 'label'].edge_label_index.size(1), num_classes, device)
+
+    train_data_LP['paper'].sup_mask = torch.zeros_like(train_mask)
+    train_data_LP['paper'].sup_mask[sup_edge_index[0]] = 1
 
     train_data_LP = T.ToUndirected()(train_data_LP)
     val_data_LP = T.ToUndirected()(val_data_LP)
@@ -263,13 +268,17 @@ def convert_batch_edges(batch, is_training, neg_pos_ratio):
         # negative
         # we only want the negative edges of the three source nodes, but we want all of them, even those that are not in the k hop subgraph!
         neg_edge_index =  batch['paper', 'is', 'label'].neg_edge_index
-        paper_mask = torch.isin(neg_edge_index[0], batch['paper'].n_id[:batch['paper'].batch_size])
+
+        paper_ids = batch['paper'].n_id[:batch['paper'].batch_size].to(neg_edge_index.device)
+        paper_mask = torch.isin(neg_edge_index[0], paper_ids)
+
+        #paper_mask = torch.isin(neg_edge_index[0], batch['paper'].n_id[:batch['paper'].batch_size])
         #label_mask = torch.isin(neg_edge_index[1], batch['label'].n_id)           
         #final_mask = paper_mask & label_mask
         neg_edge_index = neg_edge_index[:, paper_mask]
         batch['paper', 'is', 'label'].neg_edge_index = neg_edge_index
         global_neg_edge_index_label = neg_edge_index[1].unsqueeze(0)
-        local_neg_edge_index_paper = torch.tensor([[global_to_local_paper[node.item()] for node in batch['paper', 'is', 'label'].neg_edge_index[0]]], dtype=torch.long)
+        local_neg_edge_index_paper = torch.tensor([[global_to_local_paper[node.item()] for node in batch['paper', 'is', 'label'].neg_edge_index[0]]], dtype=torch.long).to(global_neg_edge_index_label.device)
         #local_neg_edge_index_label = torch.tensor([[global_to_local_label[node.item()] for node in batch['paper', 'is', 'label'].neg_edge_index[1]]], dtype=torch.long)
         local_neg_edge_index = torch.cat((local_neg_edge_index_paper, global_neg_edge_index_label))
         batch['paper', 'is', 'label'].neg_edge_index = local_neg_edge_index
@@ -277,11 +286,15 @@ def convert_batch_edges(batch, is_training, neg_pos_ratio):
     # positive
     # I will keep label ids as global but translate the paper ids to local
     pos_edge_index = batch['paper', 'is', 'label'].edge_label_index
-    paper_mask = torch.isin(pos_edge_index[0], batch['paper'].n_id[:batch['paper'].batch_size])
+
+    paper_ids = batch['paper'].n_id[:batch['paper'].batch_size].to(pos_edge_index.device)
+    paper_mask = torch.isin(pos_edge_index[0], paper_ids)
+
+    # paper_mask = torch.isin(pos_edge_index[0], batch['paper'].n_id[:batch['paper'].batch_size])
     pos_edge_index = pos_edge_index[:, paper_mask]
     
     
-    local_pos_edge_index_paper = torch.tensor([[global_to_local_paper[node.item()] for node in pos_edge_index[0]]], dtype=torch.long)
+    local_pos_edge_index_paper = torch.tensor([[global_to_local_paper[node.item()] for node in pos_edge_index[0]]], dtype=torch.long).to(pos_edge_index.device)
     global_pos_edge_index_label = pos_edge_index[1].unsqueeze(0)
 
     local_pos_edge_index = torch.cat((local_pos_edge_index_paper, global_pos_edge_index_label), dim=0)
@@ -406,6 +419,8 @@ def main():
         dataset = HeterophilousGraphDataset(root='../data/RomanEmpire', name='Roman-empire')
     elif ds == 'Squirrel':
         dataset = WikipediaNetwork(root='../data/squirrel', name='squirrel')
+    elif ds == 'OGBN':
+        dataset = PygNodePropPredDataset(name='ogbn-arxiv', root='../data/ogbn_arxiv')
     else:
         print("Invalid dataset name.")
         return
@@ -425,6 +440,8 @@ def main():
     
         transform = RandomNodeSplit(num_val=0.1, num_test=0.1)
         data = transform(og_data.clone()).to(device)
+        if data.y.dim() == 2 and data.y.size(1) == 1:
+            data.y = data.y.squeeze(1)
         num_classes = data.y.max().item() + 1
 
         num_neighbors_NC = [10, 5, 5]

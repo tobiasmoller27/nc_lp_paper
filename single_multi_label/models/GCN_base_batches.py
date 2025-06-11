@@ -424,7 +424,6 @@ def main():
     elif ds =='Yelp':
         dataset=Yelp(root='data/yelp')
         dataset = dataset[0]
-
     else:
         print("Invalid dataset name.")
         return
@@ -498,7 +497,7 @@ def main():
         optimizer_NC = torch.optim.Adam(model_NC.parameters(), lr=lr_NC)
         criterion_NC = torch.nn.BCEWithLogitsLoss()
     
-        start_patience = 100
+        start_patience = 10
         patience = start_patience
         best_val_nc = 0
         best_test_prec_nc = 0
