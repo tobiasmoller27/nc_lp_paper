@@ -4,6 +4,7 @@ import random
 import numpy as np
 import torch
 import torch_geometric.transforms as T
+from ogb.nodeproppred import PygNodePropPredDataset
 from torch_geometric.data import HeteroData
 from torch_geometric.transforms import RandomNodeSplit
 from torch_geometric.datasets import CitationFull
@@ -255,13 +256,14 @@ def convert_batch_edges(batch, is_training, neg_pos_ratio):
         # negative
         # we only want the negative edges of the three source nodes, but we want all of them, even those that are not in the k hop subgraph!
         neg_edge_index =  batch['paper', 'is', 'label'].neg_edge_index
-        paper_mask = torch.isin(neg_edge_index[0], batch['paper'].n_id[:batch['paper'].batch_size])
+        paper_ids = batch['paper'].n_id[:batch['paper'].batch_size].to(neg_edge_index.device)
+        paper_mask = torch.isin(neg_edge_index[0], paper_ids)
         #label_mask = torch.isin(neg_edge_index[1], batch['label'].n_id)           
         #final_mask = paper_mask & label_mask
         neg_edge_index = neg_edge_index[:, paper_mask]
         batch['paper', 'is', 'label'].neg_edge_index = neg_edge_index
         global_neg_edge_index_label = neg_edge_index[1].unsqueeze(0)
-        local_neg_edge_index_paper = torch.tensor([[global_to_local_paper[node.item()] for node in batch['paper', 'is', 'label'].neg_edge_index[0]]], dtype=torch.long)
+        local_neg_edge_index_paper = torch.tensor([[global_to_local_paper[node.item()] for node in batch['paper', 'is', 'label'].neg_edge_index[0]]], dtype=torch.long).to(global_neg_edge_index_label.device)
         #local_neg_edge_index_label = torch.tensor([[global_to_local_label[node.item()] for node in batch['paper', 'is', 'label'].neg_edge_index[1]]], dtype=torch.long)
         local_neg_edge_index = torch.cat((local_neg_edge_index_paper, global_neg_edge_index_label))
         batch['paper', 'is', 'label'].neg_edge_index = local_neg_edge_index
@@ -269,11 +271,12 @@ def convert_batch_edges(batch, is_training, neg_pos_ratio):
     # positive
     # I will keep label ids as global but translate the paper ids to local
     pos_edge_index = batch['paper', 'is', 'label'].edge_label_index
-    paper_mask = torch.isin(pos_edge_index[0], batch['paper'].n_id[:batch['paper'].batch_size])
+    paper_ids = batch['paper'].n_id[:batch['paper'].batch_size].to(pos_edge_index.device)
+    paper_mask = torch.isin(pos_edge_index[0], paper_ids)
     pos_edge_index = pos_edge_index[:, paper_mask]
     
     
-    local_pos_edge_index_paper = torch.tensor([[global_to_local_paper[node.item()] for node in pos_edge_index[0]]], dtype=torch.long)
+    local_pos_edge_index_paper = torch.tensor([[global_to_local_paper[node.item()] for node in pos_edge_index[0]]], dtype=torch.long).to(pos_edge_index.device)
     global_pos_edge_index_label = pos_edge_index[1].unsqueeze(0)
 
     local_pos_edge_index = torch.cat((local_pos_edge_index_paper, global_pos_edge_index_label), dim=0)
@@ -354,7 +357,7 @@ def evaluate_link_prediction(model, device, loader, train_data_LP, neg_pos_ratio
 
 def save_run(test_acc_NC, test_acc_LP, hidden_channels, embedding_size, num_epochs, lr_NC, lr_LP, num_seeds, two_layers, msg_split_ratio, ds, neg_pos_ratio):
     run_name = time.strftime("%Y%m%d_%H%M%S")
-    save_path = os.path.join("runs", "GS_"+ds, run_name)
+    save_path = os.path.join("runs", "GIN_"+ds, run_name)
     if not os.path.isdir(save_path):
         os.makedirs(save_path)
     
@@ -397,11 +400,13 @@ def main():
         dataset = HeterophilousGraphDataset(root='../data/RomanEmpire', name='Roman-empire')
     elif ds == 'Squirrel':
         dataset = WikipediaNetwork(root='../data/squirrel', name='squirrel')
+    elif ds == 'OGBN':
+        dataset = PygNodePropPredDataset(name='ogbn-arxiv', root='../data/ogbn_arxiv')
     else:
         print("Invalid dataset name.")
         return
     
-    print("Running GS on dataset:", ds)
+    print("Running GIN on dataset:", ds)
 
     og_data = dataset[0]
     og_data = T.ToUndirected()(og_data).to(device)
@@ -416,6 +421,8 @@ def main():
     
         transform = RandomNodeSplit(num_val=0.1, num_test=0.1)
         data = transform(og_data.clone()).to(device)
+        if data.y.dim() == 2 and data.y.size(1) == 1:
+            data.y = data.y.squeeze(1)
         num_classes = data.y.max().item() + 1
 
         num_neighbors_NC = [10, 5, 5]

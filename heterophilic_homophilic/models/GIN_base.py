@@ -262,7 +262,7 @@ def evaluate_link_prediction(model, data, mask, og_data):
 
 def save_run(test_acc_NC, test_acc_LP, hidden_channels, embedding_size, num_epochs, lr_NC, lr_LP, num_seeds, two_layers, msg_split_ratio, ds, neg_pos_ratio):
     run_name = time.strftime("%Y%m%d_%H%M%S")
-    save_path = os.path.join("runs", "GS_"+ds, run_name)
+    save_path = os.path.join("runs", "GIN_"+ds, run_name)
     if not os.path.isdir(save_path):
         os.makedirs(save_path)
     
@@ -308,7 +308,7 @@ def main():
         print("Invalid dataset name.")
         return
     
-    print("Running GS on dataset:", ds)
+    print("Running GIN on dataset:", ds)
 
     og_data = dataset[0]
     og_data = T.ToUndirected()(og_data).to(device)
