@@ -101,6 +101,9 @@ def main():
         transform = RandomNodeSplit(num_val=0.1, num_test=0.1)
         data = transform(og_data.clone()).to(device)
 
+        if data.y.dim() == 2 and data.y.size(1) == 1:
+            data.y = data.y.squeeze(1)
+
         print(data)
         print(data.train_mask)
     
@@ -118,7 +121,6 @@ def main():
         
 
         # rewire to LP
-
         
         label_node_ids = torch.arange(num_nodes, num_nodes + num_classes, dtype=torch.long)
         num_train = data.train_mask.sum().item()
@@ -138,10 +140,7 @@ def main():
         data.val_mask = torch.cat((data.val_mask, label_nodes_mask))
         data.test_mask = torch.cat((data.test_mask, label_nodes_mask))
 
-        if ds == 'OGBN':
-            data.y = torch.cat((data.y, torch.arange(0, num_classes).unsqueeze(1).to(device)))
-        else:
-            data.y = torch.cat((data.y, torch.arange(0, num_classes).to(device)))
+        data.y = torch.cat((data.y, torch.arange(0, num_classes).to(device)))
 
         logits_LP = lpa(data.y, data.edge_index, mask=data.train_mask)
         preds_LP = logits_LP.argmax(dim=-1)
