@@ -118,7 +118,8 @@ def evaluate_node_classification(model, data, mask, og_data, loader, device):
             out = model(batch.x, batch.edge_index)
             out = out[:batch.batch_size]
             y = batch.y[:batch.batch_size]
-            precision = ap_score(y, out)
+            preds = torch.sigmoid(out)
+            precision = ap_score(y, preds)
             total_precision += precision
     return total_precision/len(loader)
 

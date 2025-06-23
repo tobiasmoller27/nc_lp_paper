@@ -267,24 +267,6 @@ def evaluate_link_prediction(model, data, mask, og_data):
     return precision.item()
 
 
-class HeteroNCModel(torch.nn.Module):
-    def __init__(self, hidden_channels, embedding_size, num_classes, metadata, two_layers):
-        super().__init__()
-        self.hetero_encoder = to_hetero(
-            GraphSAGE(hidden_channels, embedding_size, two_layers),
-            metadata
-        )
-        self.paper_classifier = torch.nn.Linear(embedding_size, num_classes)
-        
-    def forward(self, x_dict, edge_index_dict):
-        z_dict = self.hetero_encoder(x_dict, edge_index_dict)
-        
-        z_paper = z_dict['paper']     
-        
-        out_paper = self.paper_classifier(z_paper)
-        
-        return {'paper': out_paper}
-    
 
 def save_run(test_prec_NC, test_prec_LP, hidden_channels, embedding_size, num_epochs, lr_NC, lr_LP, num_seeds, two_layers, msg_split_ratio, ds, neg_pos_ratio):
     run_name = time.strftime("%Y%m%d_%H%M%S")
