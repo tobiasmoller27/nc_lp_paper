@@ -6,5 +6,6 @@ for ds_name in "${DATASETS[@]}"; do
     python models/GIN_base.py --num_epochs 10000 \
                     --num_seeds 10 \
                     --save_results True \
-                    --ds "$ds_name"
+                    --ds "$ds_name" \
+                    --lr_LP 0.0001
 done
