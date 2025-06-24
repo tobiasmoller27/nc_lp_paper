@@ -542,6 +542,7 @@ def main():
         optimizer_LP = torch.optim.Adam(model_LP.parameters(), lr=lr_LP)
         criterion_LP = torch.nn.BCEWithLogitsLoss()
 
+        start_patience = 800
         best_val_lp = 0
         best_test_prec_lp = 0
         patience = start_patience
