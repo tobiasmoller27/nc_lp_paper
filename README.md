@@ -1,4 +1,6 @@
-# Source Code for Representations of Graphs and Their Impact on Graph Neural Networks
+# Source Code for Formulating Node Labelling as Node Classification or Link Prediction in Different Graph Representations
+
+The paper can be found [here](https://openreview.net/forum?id=lK7tjysj0s).
 
 Models can be found in the "models" folder in each dataset category folder. When running the models with the flag `--save_results True`, test scores will be saved under "runs" in the corresponding "models" folder, in a directory named after the timestamp of completion.
 
